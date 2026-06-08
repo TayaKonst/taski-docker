@@ -1,15 +1,146 @@
-name: Main Taski Workflow
+name: Taski CI/CD
 
 on:
   push:
-    branches:
-      - main
 
 jobs:
-  checkout-and-print-tree:
+  tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: django_user
+          POSTGRES_PASSWORD: django_password
+          POSTGRES_DB: django_db
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v3
-      - name: Print project tree
-        run: tree .
+      - uses: actions/checkout@v3
+
+      - name: Установка Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8==6.0.0
+          pip install -r backend/requirements.txt
+
+      - name: Проверка кода на соответствие PEP8
+        run: python -m flake8 backend/
+
+      - name: Тесты бэкенда
+        env:
+          POSTGRES_USER: django_user
+          POSTGRES_PASSWORD: django_password
+          POSTGRES_DB: django_db
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          SECRET_KEY: test-secret-key
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 'localhost,127.0.0.1'
+        run: |
+          cd backend
+          python manage.py test
+
+      - name: Установка Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Установка зависимостей фронтенда
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Тесты фронтенда
+        run: |
+          cd frontend
+          npm test -- --watchAll=false
+
+  build_and_push:
+    name: Сборка и публикация образов на Docker Hub
+    runs-on: ubuntu-latest
+    needs: tests
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Настройка Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Вход в Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Сборка и публикация образа бэкенда
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/taski_backend:latest
+
+      - name: Сборка и публикация образа фронтенда
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/taski_frontend:latest
+
+      - name: Сборка и публикация образа шлюза
+        uses: docker/build-push-action@v4
+        with:
+          context: ./gateway
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/taski_gateway:latest
+
+  deploy:
+    name: Деплой на сервер
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Копирование docker-compose.production.yml на сервер
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.production.yml
+          target: taski/
+
+      - name: Деплой через SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd taski
+            sudo docker compose -f docker-compose.production.yml pull
+            sudo docker compose -f docker-compose.production.yml down
+            sudo docker compose -f docker-compose.production.yml up -d
+            sudo docker compose -f docker-compose.production.yml exec backend python manage.py migrate
+            sudo docker compose -f docker-compose.production.yml exec backend python manage.py collectstatic --no-input
+
+  send_message:
+    name: Отправка уведомления в Telegram
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Отправить сообщение
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            Taski успешно задеплоен!
+            Коммит: ${{ github.event.commits[0].message }}
+            Автор: ${{ github.actor }}
